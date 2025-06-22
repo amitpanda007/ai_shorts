@@ -3,6 +3,7 @@ import yt_dlp
 import whisper
 import moviepy.editor as mp
 from moviepy.video.tools.subtitles import SubtitlesClip
+from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 import moviepy.config as cf
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -14,6 +15,7 @@ from google import genai
 from google.genai import types
 import re
 import glob
+import multiprocessing
 
 # This line is specific to your system and can be kept.
 cf.IMAGEMAGICK_BINARY = r"C:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe"
@@ -54,6 +56,16 @@ class ClipCounter:
     def __init__(self): self.count = 0
 
     def get(self): self.count += 1; return self.count
+
+
+def _get_video_id(source: str) -> str:
+    """Generates a filesystem-safe ID from a YouTube URL or local file path."""
+    if source.startswith(('http://', 'https://')):
+        match = re.search(r"v=([a-zA-Z0-9_-]{11})", source)
+        if match:
+            return match.group(1)
+    # For local files, use the filename without extension
+    return os.path.splitext(os.path.basename(source))[0]
 
 
 def download_video(url: str, download_path: str) -> str:
@@ -98,22 +110,15 @@ def transcribe_audio(video_path: str) -> dict:
 def _parse_llm_response(content: str) -> list:
     """
     Parses and sanitizes the LLM's JSON response, removing markdown fences.
+    An empty list is a valid response.
     """
-    print(f"LLM Raw Response: '{content}'")  # Use quotes to see leading/trailing characters
-
-    # Sanitize the response: remove markdown fences and trim whitespace
     sanitized_content = content.strip()
     if sanitized_content.startswith("```json"):
         sanitized_content = sanitized_content[7:]
     elif sanitized_content.startswith("```"):
         sanitized_content = sanitized_content[3:]
-
-    if sanitized_content.endswith("```"):
-        sanitized_content = sanitized_content[:-3]
-
+    if sanitized_content.endswith("```"): sanitized_content = sanitized_content[:-3]
     sanitized_content = sanitized_content.strip()
-
-    print(f"Sanitized Content for JSON parsing: '{sanitized_content}'")
 
     data = json.loads(sanitized_content)
     highlights = []
@@ -123,8 +128,12 @@ def _parse_llm_response(content: str) -> list:
         highlights = data
     elif isinstance(data, dict) and 'start' in data and 'end' in data:
         highlights = [data]
-    if not highlights or not all('start' in d and 'end' in d for d in highlights):
-        raise ValueError("LLM did not return the expected format of clip objects.")
+
+    # New validation: only error if the list is NOT empty but contains bad data.
+    # An empty list `[]` is a valid success case.
+    if highlights and not all('start' in d and 'end' in d for d in highlights):
+        raise ValueError("LLM response is a non-empty list but items lack 'start' or 'end' keys.")
+
     return highlights
 
 
@@ -175,75 +184,87 @@ def find_highlights_with_llm(transcription: dict, num_clips: int, min_duration: 
         return []
 
 
-class ClipCounter:
-    def __init__(self): self.count = 0
-    def get(self): self.count += 1; return self.count
-
-
-def _get_video_id(source: str) -> str:
-    """Generates a filesystem-safe ID from a YouTube URL or local file path."""
-    if source.startswith(('http://', 'https://')):
-        match = re.search(r"v=([a-zA-Z0-9_-]{11})", source)
-        if match:
-            return match.group(1)
-    # For local files, use the filename without extension
-    return os.path.splitext(os.path.basename(source))[0]
-
-
 def create_clip_with_subtitles(original_video_path, chunk_transcription, absolute_start_time, absolute_end_time,
                                clip_start_in_chunk, clip_num):
-    """Creates a video clip from the original video using absolute times, but generates subtitles using the chunk's transcription."""
-    print(f"Creating clip #{clip_num} from original video at {absolute_start_time}s to {absolute_end_time}s...")
+    """Creates a single video clip. Designed to be run in an isolated process for stability."""
+    try:
+        print(
+            f"Creating clip #{clip_num} from original video at {absolute_start_time:.2f}s to {absolute_end_time:.2f}s...")
+        with mp.VideoFileClip(original_video_path) as video:
+            with video.subclip(absolute_start_time, absolute_end_time) as clip:
+                def subtitle_generator(txt):
+                    words_in_clip = []
+                    clip_end_in_chunk = clip_start_in_chunk + clip.duration
+                    for segment in chunk_transcription['segments']:
+                        for word_info in segment['words']:
+                            if word_info['start'] >= clip_start_in_chunk and word_info['end'] <= clip_end_in_chunk:
+                                relative_start, relative_end = word_info['start'] - clip_start_in_chunk, word_info[
+                                    'end'] - clip_start_in_chunk
+                                words_in_clip.append(((relative_start, relative_end), word_info['word']))
+                    return words_in_clip
 
-    # ### MODIFICATION: Use 'with' statement for robust resource management ###
-    with mp.VideoFileClip(original_video_path) as video:
-        with video.subclip(absolute_start_time, absolute_end_time) as clip:
-            def subtitle_generator(txt):
-                words_in_clip = []
-                clip_end_in_chunk = clip_start_in_chunk + (absolute_end_time - absolute_start_time)
-                for segment in chunk_transcription['segments']:
-                    for word_info in segment['words']:
-                        if word_info['start'] >= clip_start_in_chunk and word_info['end'] <= clip_end_in_chunk:
-                            relative_start, relative_end = word_info['start'] - clip_start_in_chunk, word_info[
-                                'end'] - clip_start_in_chunk
-                            words_in_clip.append(((relative_start, relative_end), word_info['word']))
-                return words_in_clip
+                subtitles = SubtitlesClip(subtitle_generator(chunk_transcription),
+                                          lambda txt: mp.TextClip(txt, font='Arial-Bold', fontsize=48, color='white',
+                                                                  stroke_color='black', stroke_width=2,
+                                                                  method='caption', size=(clip.w * 0.8, None)))
+                final_clip = mp.CompositeVideoClip([clip, subtitles.set_position(('center', 0.85), relative=False)])
 
-            subtitles = SubtitlesClip(subtitle_generator(chunk_transcription),
-                                      lambda txt: mp.TextClip(txt, font='Arial-Bold', fontsize=48, color='white',
-                                                              stroke_color='black', stroke_width=2, method='caption',
-                                                              size=(clip.w * 0.8, None)))
-            final_clip = mp.CompositeVideoClip([clip, subtitles.set_position(('center', 0.75), relative=True)])
+                if final_clip.w / final_clip.h > 9.0 / 16.0:
+                    final_clip = final_clip.crop(x_center=final_clip.w / 2, width=int(final_clip.h * 9.0 / 16.0))
 
-            (w, h) = final_clip.size
-            if w / h > 9.0 / 16.0:
-                final_clip = final_clip.crop(x_center=w / 2, width=int(h * 9.0 / 16.0))
+                base_name = os.path.splitext(os.path.basename(original_video_path))[0]
+                output_filename = os.path.join(OUTPUT_DIR, f"FINAL_{base_name}_clip_{clip_num}.mp4")
 
-            base_name = os.path.splitext(os.path.basename(original_video_path))[0]
-            output_filename = os.path.join(OUTPUT_DIR, f"{base_name}_clip_{clip_num}.mp4")
+                # --- THE FIX ---
+                # Use a unique temporary audio file for each process to avoid conflicts.
+                temp_audio_filename = f"temp-audio-{clip_num}.m4a"
 
-            final_clip.write_videofile(output_filename, codec="libx264", audio_codec="aac",
-                                       temp_audiofile='temp-audio.m4a', remove_temp=True, preset="medium",
-                                       bitrate="5000k", threads=4, fps=clip.fps, logger=None)
-            print(f"Successfully created clip: {output_filename}")
+                final_clip.write_videofile(
+                    output_filename,
+                    codec="libx264",
+                    audio_codec="aac",
+                    temp_audiofile=temp_audio_filename,  # Use the unique filename
+                    remove_temp=True,
+                    preset="medium",
+                    bitrate="5000k",
+                    threads=4,  # Each process can use multiple threads
+                    fps=clip.fps,
+                    logger=None
+                )
+                print(f"Successfully created clip: {output_filename}")
+    except Exception as e:
+        print(f"--- ERROR in subprocess for clip #{clip_num}: {e} ---")
 
 
 def process_video_chunk(original_video_path, chunk_path, time_offset, clip_counter, num_clips, min_duration,
                         max_duration):
-    """Transcribes a video chunk, finds highlights, and creates clips."""
+    """Transcribes a chunk and spawns isolated processes for clip creation."""
     print(f"\n--- Processing chunk: {os.path.basename(chunk_path)} (starts at {time_offset:.2f}s) ---")
     try:
         transcription = transcribe_audio(chunk_path)
         if not transcription['segments']: print("No speech detected in this chunk."); return
-
         if AI_SERVICE:
             highlights = find_highlights_with_llm(transcription, num_clips, min_duration, max_duration, AI_SERVICE)
             if not highlights: print("No highlights found in this chunk."); return
+
+            processes = []
             for h in highlights:
                 absolute_start = h['start'] + time_offset;
                 absolute_end = h['end'] + time_offset
-                create_clip_with_subtitles(original_video_path, transcription, absolute_start, absolute_end, h['start'],
-                                           clip_counter.get())
+
+                # ### FIX 1 (continued): Create and start a new process for each clip ###
+                p = multiprocessing.Process(
+                    target=create_clip_with_subtitles,
+                    args=(original_video_path, transcription, absolute_start, absolute_end, h['start'],
+                          clip_counter.get())
+                )
+                processes.append(p)
+                p.start()
+
+            # Wait for all clip-making processes for this chunk to finish
+            for p in processes:
+                p.join()
+
         else:
             print("No AI service is available to find highlights.")
     except Exception as e:
@@ -254,43 +275,31 @@ def main_workflow(input_source: str, num_clips_per_chunk: int, min_duration: int
                   force_process: bool = False):
     """The main function with robust caching and chunking logic for video processing."""
     try:
-        video_id = _get_video_id(input_source)
-        video_cache_dir = os.path.join(CACHE_DIR, video_id)
+        video_id = _get_video_id(input_source);
+        video_cache_dir = os.path.join(CACHE_DIR, video_id);
         source_cache_path = os.path.join(video_cache_dir, "source.mp4")
-
-        if force_process and os.path.exists(video_cache_dir):
-            print("Force processing enabled. Deleting existing cache...")
-            shutil.rmtree(video_cache_dir)
-
+        if force_process and os.path.exists(video_cache_dir): print(
+            "Force processing enabled. Deleting existing cache..."); shutil.rmtree(video_cache_dir)
         if not os.path.exists(video_cache_dir):
-            print(f"No cache found for '{video_id}'. Processing from scratch.")
+            print(f"No cache found for '{video_id}'. Processing from scratch.");
             os.makedirs(video_cache_dir, exist_ok=True)
             if input_source.startswith(('http://', 'https://')):
                 source_cache_path = download_video(input_source, source_cache_path)
             else:
-                print(f"Copying local file to cache: {input_source}")
-                shutil.copy(input_source, source_cache_path)
-
-            print("Chunking video...")
-            # Get duration first without keeping the file open
+                print(f"Copying local file to cache: {input_source}"); shutil.copy(input_source, source_cache_path)
+            print("Chunking video...");
             with mp.VideoFileClip(source_cache_path) as video:
                 duration = video.duration
-
             if duration <= CHUNK_DURATION:
                 shutil.copy(source_cache_path, os.path.join(video_cache_dir, "chunk_0.mp4"))
             else:
                 num_chunks = int(-(-duration // CHUNK_DURATION))
                 for i in range(num_chunks):
-                    start_time = i * CHUNK_DURATION
+                    start_time = i * CHUNK_DURATION;
                     end_time = min((i + 1) * CHUNK_DURATION, duration)
-                    chunk_path = os.path.join(video_cache_dir, f"chunk_{i}.mp4")
-                    print(f"  - Creating chunk {i+1}/{num_chunks}...")
-
-                    # ### MODIFICATION: Open the video inside the loop for each chunk ###
-                    # This is the key fix to prevent the 'NoneType' error.
-                    with mp.VideoFileClip(source_cache_path) as video:
-                        with video.subclip(start_time, end_time) as chunk_clip:
-                            chunk_clip.write_videofile(chunk_path, codec="libx264", preset="fast", logger=None)
+                    chunk_path = os.path.join(video_cache_dir, f"chunk_{i}.mp4");
+                    print(f"  - Creating chunk {i + 1}/{num_chunks}...")
+                    ffmpeg_extract_subclip(source_cache_path, start_time, end_time, targetname=chunk_path)
         else:
             print(f"Cache found for '{video_id}'. Using cached video and chunks.")
 
@@ -298,20 +307,18 @@ def main_workflow(input_source: str, num_clips_per_chunk: int, min_duration: int
         chunk_paths = sorted(glob.glob(os.path.join(video_cache_dir, "chunk_*.mp4")))
         for i, chunk_path in enumerate(chunk_paths):
             time_offset = i * CHUNK_DURATION
-            process_video_chunk(source_cache_path, chunk_path, time_offset, clip_counter, num_clips_per_chunk, min_duration, max_duration)
-
+            process_video_chunk(source_cache_path, chunk_path, time_offset, clip_counter, num_clips_per_chunk,
+                                min_duration, max_duration)
         print("\nAll processing complete!")
-
     except Exception as e:
-        import traceback
-        print(f"\nAn error occurred in the main workflow: {e}")
-        traceback.print_exc()
+        import traceback; print(f"\nAn error occurred in the main workflow: {e}"); traceback.print_exc()
 
 
 if __name__ == '__main__':
+    multiprocessing.freeze_support()
     INPUT_SOURCE = "https://www.youtube.com/watch?v=R0Fxd13ogUg"
     # INPUT_SOURCE = r"E:\TV\Brooklyn Nine Nine\Season 7\Brooklyn.Nine-Nine.S07E06.WEBRip.x264-ION10.mp4"
-    NUM_CLIPS_PER_CHUNK = 1
+    NUM_CLIPS_PER_CHUNK = 3
     MIN_CLIP_DURATION = 30
     MAX_CLIP_DURATION = 60
     FORCE_PROCESS = False
