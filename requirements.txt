@@ -1,0 +1,8 @@
+yt-dlp
+openai-whisper
+moviepy==1.0.3
+openai # Keep for optional use
+python-dotenv
+ollama # Add this
+# For the optional Streamlit GUI
+streamlit
